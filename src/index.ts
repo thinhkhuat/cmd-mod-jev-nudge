@@ -1,6 +1,8 @@
 // jev-nudge mod — the "agent stopped too early" fix from Will Brown's stop hook,
 // as a Command Code Stop hook backed by Jev (typesafe.ai's System One model) through
-// Command Code's own provider, on the key the user already signed in with.
+// jevd, the owner's warm local relay. jevd holds the provider keys and picks the provider
+// per call, so the mod sends no key; pointing `jev-nudge-base-url` at a non-loopback host
+// falls back to a direct provider route, keyed as the upstream mod was.
 //
 // When a run would end naturally, the hook shows Jev a compressed view of the session (what
 // the user asked for across every turn, the reply the agent is stopping on, recent tool
@@ -9,10 +11,10 @@
 // a probability, not prose, so the decision is a threshold, and two guard questions veto a
 // nudge when the run is waiting on the user or when the last nudge produced no progress.
 //
-// Dormant without a key: it reads CMD_API_KEY or COMMAND_CODE_API_KEY, else the `apiKey`
-// `cmd login` saved to ~/.commandcode/auth.json, at factory time and registers nothing but
-// its flags when none is there. A failing or slow Jev call never changes the stop — the run
-// ends exactly as it would have without the mod.
+// jevd holds the keys, so the mod is always live on the loopback route; on a direct route
+// it needs CMD_API_KEY or COMMAND_CODE_API_KEY, else the `apiKey` `cmd login` saved to
+// ~/.commandcode/auth.json — without one it says so and keeps the stops. A failing or slow
+// Jev call never changes the stop — the run ends exactly as it would have without the mod.
 //
 // Standalone package: only TYPES come from @commandcode/harness, so the file loads under
 // jiti from any install location without resolving the harness at runtime. Decisions are
@@ -21,21 +23,21 @@
 import {readFileSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
-import type {ModApi} from './types.js';
 import {askJev, type JevFetch} from './client.js';
 import {
 	buildNudgeState,
+	CMD_KEY_ENV,
 	DEFAULT_THRESHOLD,
 	decideNudge,
 	JEV_NUDGE_MOD_NAME,
 	NUDGE_REASON,
 	nudgeQuestions,
+	type PreviousNudge,
 	parseMaxNudges,
 	parseThreshold,
-	type PreviousNudge,
 	resolveJevConfig,
-	CMD_KEY_ENV,
 } from './protocol.js';
+import type {ModApi} from './types.js';
 
 // A stop decision is on the critical path between "model finished" and "prompt comes back";
 // a gut-check model should answer well inside this, and past it the run just stops.
@@ -78,12 +80,12 @@ export function createJevNudgeMod(
 		cmd.addFlag('jev-nudge-base-url', {
 			type: 'string',
 			description:
-				'API root for Jev (default: https://api.commandcode.ai)',
+				'SystemOne base (default: jevd at http://127.0.0.1:4377). A non-loopback value is a direct provider route and needs CMD_API_KEY',
 		});
 		cmd.addFlag('jev-nudge-model', {
 			type: 'string',
 			description:
-				'Model id sent to the endpoint (default: typesafe/jev)',
+				'Model id sent to the route (default: none — jevd’s ladder picks the provider; on a direct route defaults to typesafe/jev)',
 		});
 
 		cmd.addFlag('jev-nudge-verbose', {
@@ -93,19 +95,11 @@ export function createJevNudgeMod(
 				'Show every stop decision as a feed row, not only the nudges (for trying the mod out)',
 		});
 
-		// Flags are applied after every factory has run (setFlagValue), so the endpoint is
-		// resolved lazily at the first stop — only the key check happens here. A user who
-		// loaded this mod on purpose deserves to hear why it does nothing.
-		if (!resolveJevConfig({env, storedKey})) {
-			cmd.ui.notify(
-				`${JEV_NUDGE_MOD_NAME}: no Command Code key (run \`cmd login\` or set ${CMD_KEY_ENV}), nudging is off`,
-				'warning',
-			);
-			return;
-		}
-
 		let run: RunBookkeeping = FRESH_RUN;
 		const verbose = (): boolean => cmd.getFlag('jev-nudge-verbose') === true;
+		// A direct (non-loopback) route without a key is the one config the mod cannot form.
+		// Say it once, not on every stop.
+		let warnedKeyless = false;
 
 		cmd.hooks({
 			onTurnStart: async ({state, turnNumber}) => {
@@ -132,7 +126,16 @@ export function createJevNudgeMod(
 						model: stringFlag(cmd.getFlag('jev-nudge-model')),
 					},
 				});
-				if (!config) return undefined;
+				if (!config) {
+					if (!warnedKeyless) {
+						warnedKeyless = true;
+						cmd.ui.notify(
+							`${JEV_NUDGE_MOD_NAME}: no Command Code key (run \`cmd login\` or set ${CMD_KEY_ENV}); the loopback jevd route has no such requirement, nudging is off for this direct route`,
+							'warning',
+						);
+					}
+					return undefined;
+				}
 				const maxNudges = parseMaxNudges(cmd.getFlag('jev-nudge-max'));
 				if (run.nudges.length >= maxNudges) return undefined;
 				const threshold = parseThreshold(cmd.getFlag('jev-nudge-threshold'));
@@ -164,7 +167,8 @@ export function createJevNudgeMod(
 				} catch (error) {
 					// Best-effort: the stop decision must never depend on a network call succeeding,
 					// but a failing call is said out loud so "no nudge" is never a mystery.
-					const message = error instanceof Error ? error.message : String(error);
+					const message =
+						error instanceof Error ? error.message : String(error);
 					dlog(`[${JEV_NUDGE_MOD_NAME}] ${message}`);
 					cmd.ui.notify(
 						`${JEV_NUDGE_MOD_NAME}: Jev call failed (${message}), letting the run stop`,
@@ -185,7 +189,11 @@ export function createJevNudgeMod(
 				run = {
 					nudges: [
 						...previousNudges,
-						{turnNumber, toolCallsAfter: 0, assistantTextAtNudge: lastAssistantText},
+						{
+							turnNumber,
+							toolCallsAfter: 0,
+							assistantTextAtNudge: lastAssistantText,
+						},
 					],
 					toolCallsSinceNudge: 0,
 				};

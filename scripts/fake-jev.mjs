@@ -1,11 +1,12 @@
-// Local stand-in for Jev, for trying the mod offline. Serves Command Code's POST
-// /provider/v1/systemone and answers with fixed rules instead of a model: nudge 86% unless the reply
-// says the work is done, waiting 92% when the reply ends with a question, progress 90% when
-// tools ran or the reply changed since the last nudge. Every request is appended to jev-log.jsonl so you can see
-// exactly what the mod sent.
+// Local stand-in for jevd/Jev, for trying the mod offline. Accepts any POST whose path ends
+// in /systemone (jevd's own convention, so the default loopback base works unchanged) and
+// answers with fixed rules instead of a model: nudge 86% unless the reply says the work is
+// done, waiting 92% when the reply ends with a question, progress 90% when tools ran or the
+// reply changed since the last nudge. Every request is appended to jev-log.jsonl so you can
+// see exactly what the mod sent.
 //
 //   node scripts/fake-jev.mjs
-//   CMD_API_KEY=x DEBUG=true cmd --mod . --mod-option jev-nudge-base-url=http://127.0.0.1:4711
+//   DEBUG=true cmd --mod . --mod-option jev-nudge-base-url=http://127.0.0.1:4711
 import {createServer} from 'node:http';
 import {appendFileSync} from 'node:fs';
 
@@ -24,7 +25,7 @@ createServer((req, res) => {
 	let body = '';
 	req.on('data', chunk => { body += chunk; });
 	req.on('end', () => {
-		if (req.method !== 'POST' || req.url !== '/provider/v1/systemone') {
+		if (req.method !== 'POST' || !req.url?.endsWith('/systemone')) {
 			res.writeHead(404).end('not found'); return;
 		}
 		const {model, state, questions} = JSON.parse(body);

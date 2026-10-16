@@ -1,16 +1,21 @@
-// jev-nudge mod tests — the wiring: dormant without a key, the request it sends, the
-// continue it returns, the per-run bookkeeping, and that Jev failures never change a stop.
+// jev-nudge mod tests — the wiring: live on the loopback jevd route without any key, direct
+// routes keyed as upstream, the request each engine sends, the continue the hook returns,
+// the per-run bookkeeping, and that Jev failures never change a stop.
 
+import {describe, expect, it} from 'vitest';
+import type {JevFetch} from '../client.js';
+import {createJevNudgeMod} from '../index.js';
+import {
+	COMMAND_CODE_BASE_URL,
+	NUDGE_REASON,
+	SYSTEM_ONE_PATH,
+} from '../protocol.js';
 import type {
 	AgentState,
 	ModApi,
 	ModFlagDefinition,
 	ModHooks,
 } from '../types.js';
-import {describe, expect, it} from 'vitest';
-import type {JevFetch} from '../client.js';
-import {createJevNudgeMod} from '../index.js';
-import {NUDGE_REASON, SYSTEM_ONE_PATH} from '../protocol.js';
 
 interface FakeHost {
 	readonly cmd: ModApi;
@@ -121,11 +126,13 @@ async function stop(
 }
 
 describe('jev-nudge mod', () => {
-	it('registers only its flags without a key, and says so', () => {
+	it('registers its flags and goes live without a key — jevd holds the keys', () => {
 		const host = fakeCmd();
-		createJevNudgeMod({env: {}, storedKey: noStoredKey, fetch: fakeFetch(() => answers(1)).fetch})(
-			host.cmd,
-		);
+		createJevNudgeMod({
+			env: {},
+			storedKey: noStoredKey,
+			fetch: fakeFetch(() => answers(1)).fetch,
+		})(host.cmd);
 		expect([...host.flags.keys()]).toEqual([
 			'jev-nudge-threshold',
 			'jev-nudge-max',
@@ -133,10 +140,8 @@ describe('jev-nudge mod', () => {
 			'jev-nudge-model',
 			'jev-nudge-verbose',
 		]);
-		expect(host.hooks).toEqual([]);
-		expect(host.notices).toEqual([
-			'warning: jev-nudge: no Command Code key (run `cmd login` or set CMD_API_KEY), nudging is off',
-		]);
+		expect(host.hooks).toHaveLength(1);
+		expect(host.notices).toEqual([]);
 	});
 
 	it('shows declined stops only with jev-nudge-verbose', async () => {
@@ -162,7 +167,7 @@ describe('jev-nudge mod', () => {
 		]);
 	});
 
-	it('posts to Command Code\u2019s System One route and continues on a confident yes', async () => {
+	it('posts to jevd with no auth, no model pin, and a part-budget header, and continues on a confident yes', async () => {
 		const host = fakeCmd();
 		const {fetch, captured} = fakeFetch(() => answers(0.85));
 		createJevNudgeMod({
@@ -175,18 +180,20 @@ describe('jev-nudge mod', () => {
 
 		expect(result).toEqual({continue: true, reason: NUDGE_REASON});
 		const request = captured.requests[0];
-		expect(request?.url).toBe(`https://api.commandcode.ai${SYSTEM_ONE_PATH}`);
+		expect(request?.url).toBe(`http://127.0.0.1:4377${SYSTEM_ONE_PATH}`);
 		expect(request?.init.method).toBe('POST');
-		// The env key wins over the stored login, as it does in the CLI.
-		expect(new Headers(request?.init.headers).get('authorization')).toBe(
-			'Bearer env-key',
-		);
+		// jevd forwards its own keys; ours would only clobber a rung it has one for, and the
+		// budget header tells it to stop trying rungs once this hook would give up.
+		const headers = new Headers(request?.init.headers);
+		expect(headers.get('authorization')).toBeNull();
+		expect(headers.get('x-jevd-budget')).toBe('8');
 		const body = JSON.parse(String(request?.init.body)) as {
-			model: string;
+			model?: string;
 			state: {user_requests: string[]; latest_assistant_message: string};
 			questions: Record<string, {type: string}>;
 		};
-		expect(body.model).toBe('typesafe/jev');
+		// No model field: absent, jevd's ladder picks the provider per call.
+		expect('model' in body).toBe(false);
 		expect(body.state.user_requests).toEqual([
 			'fix the flaky test and add a changeset',
 		]);
@@ -197,8 +204,39 @@ describe('jev-nudge mod', () => {
 		expect(host.notices[0]).toContain('jev nudge 1:');
 	});
 
-	it('uses the key `cmd login` saved when no env key is set', async () => {
+	it('pins the model on jevd when the flag is set', async () => {
 		const host = fakeCmd();
+		host.flagValues.set('jev-nudge-model', 'typesafe/jev');
+		const {fetch, captured} = fakeFetch(() => answers(0.9));
+		createJevNudgeMod({env: {}, storedKey: noStoredKey, fetch})(host.cmd);
+		expect(await stop(host)).toMatchObject({continue: true});
+		expect(JSON.parse(String(captured.requests[0]?.init.body)).model).toBe(
+			'typesafe/jev',
+		);
+	});
+
+	it('auths a direct route with the env key over the stored login, as upstream did', async () => {
+		const host = fakeCmd();
+		host.flagValues.set('jev-nudge-base-url', COMMAND_CODE_BASE_URL);
+		const {fetch, captured} = fakeFetch(() => answers(0.9));
+		createJevNudgeMod({
+			env: {CMD_API_KEY: 'env-key'},
+			storedKey: () => 'stored-key',
+			fetch,
+		})(host.cmd);
+
+		expect(await stop(host)).toMatchObject({continue: true});
+		const request = captured.requests[0];
+		expect(request?.url).toBe(`${COMMAND_CODE_BASE_URL}${SYSTEM_ONE_PATH}`);
+		const headers = new Headers(request?.init.headers);
+		expect(headers.get('authorization')).toBe('Bearer env-key');
+		expect(headers.get('x-jevd-budget')).toBeNull();
+		expect(JSON.parse(String(request?.init.body)).model).toBe('typesafe/jev');
+	});
+
+	it('uses the key `cmd login` saved when no env key is set on a direct route', async () => {
+		const host = fakeCmd();
+		host.flagValues.set('jev-nudge-base-url', COMMAND_CODE_BASE_URL);
 		const {fetch, captured} = fakeFetch(() => answers(0.9));
 		createJevNudgeMod({env: {}, storedKey: () => 'stored-key', fetch})(
 			host.cmd,
@@ -207,6 +245,18 @@ describe('jev-nudge mod', () => {
 		expect(
 			new Headers(captured.requests[0]?.init.headers).get('authorization'),
 		).toBe('Bearer stored-key');
+	});
+
+	it('says once, and goes dark, on a direct route with no key', async () => {
+		const host = fakeCmd();
+		host.flagValues.set('jev-nudge-base-url', COMMAND_CODE_BASE_URL);
+		const {fetch, captured} = fakeFetch(() => answers(1));
+		createJevNudgeMod({env: {}, storedKey: noStoredKey, fetch})(host.cmd);
+		expect(await stop(host)).toBeUndefined();
+		await stop(host);
+		expect(captured.requests).toEqual([]);
+		expect(host.notices).toHaveLength(1);
+		expect(host.notices[0]).toMatch(/^warning: jev-nudge: no Command Code key/);
 	});
 
 	it('lets the run stop when Jev says no', async () => {
@@ -223,8 +273,11 @@ describe('jev-nudge mod', () => {
 	it('only judges natural end_turn stops', async () => {
 		const host = fakeCmd();
 		const {fetch, captured} = fakeFetch(() => answers(1));
-		createJevNudgeMod({env: {CMD_API_KEY: 'ck'},
-			storedKey: noStoredKey, fetch})(host.cmd);
+		createJevNudgeMod({
+			env: {CMD_API_KEY: 'ck'},
+			storedKey: noStoredKey,
+			fetch,
+		})(host.cmd);
 		expect(await stop(host, {stopReason: 'max_tokens'})).toBeUndefined();
 		expect(captured.requests).toEqual([]);
 	});
@@ -234,7 +287,7 @@ describe('jev-nudge mod', () => {
 			const host = fakeCmd();
 			createJevNudgeMod({
 				env: {CMD_API_KEY: 'ck'},
-			storedKey: noStoredKey,
+				storedKey: noStoredKey,
 				fetch: fakeFetch(() => failure).fetch,
 			})(host.cmd);
 			expect(await stop(host)).toBeUndefined();
@@ -247,8 +300,11 @@ describe('jev-nudge mod', () => {
 		const host = fakeCmd();
 		host.flagValues.set('jev-nudge-max', '2');
 		const {fetch, captured} = fakeFetch(() => answers(0.9, 0.1, 0.9));
-		createJevNudgeMod({env: {CMD_API_KEY: 'ck'},
-			storedKey: noStoredKey, fetch})(host.cmd);
+		createJevNudgeMod({
+			env: {CMD_API_KEY: 'ck'},
+			storedKey: noStoredKey,
+			fetch,
+		})(host.cmd);
 		const hooks = host.hooks[0];
 		if (!hooks?.afterToolCall || !hooks.onTurnStart)
 			throw new Error('hooks missing');
@@ -309,7 +365,11 @@ describe('jev-nudge mod', () => {
 		host.flagValues.set('jev-nudge-model', 'jev-2');
 		host.flagValues.set('jev-nudge-threshold', '0.95');
 		const {fetch, captured} = fakeFetch(() => answers(0.9));
-		createJevNudgeMod({env: {CMD_API_KEY: 'ck'}, storedKey: noStoredKey, fetch})(host.cmd);
+		createJevNudgeMod({
+			env: {CMD_API_KEY: 'ck'},
+			storedKey: noStoredKey,
+			fetch,
+		})(host.cmd);
 
 		expect(await stop(host)).toBeUndefined();
 		expect(captured.requests[0]?.url).toBe(

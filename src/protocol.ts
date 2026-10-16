@@ -7,19 +7,22 @@
 // probabilities instead of generating text, so the "should the agent keep going?" judgment
 // comes back as numbers this file can threshold, with no prose to parse.
 
-import type {AgentMessage} from './types.js';
 import {z} from 'zod';
+import type {AgentMessage} from './types.js';
 
 export const JEV_NUDGE_MOD_NAME = 'jev-nudge';
 
-// Jev rides the user's Command Code key through Command Code's provider route, the same one
-// `cmd -p … -m typesafe/jev` uses. The key is looked up the way the CLI looks it up:
-// CMD_API_KEY first, then COMMAND_CODE_API_KEY (the name the CLI itself reads), then the
-// `apiKey` that `cmd login` saved to auth.json.
+// Jev is called through jevd, the owner's warm local relay (loopback on 4377). jevd holds the
+// provider keys and forwards each request through its provider ladder, so callers send no
+// key. The base URL follows jevd's provider convention (every SystemOne endpoint is
+// `<base>/systemone`), and `model` is left out so jevd's ladder decides which provider to
+// ask instead of pinning one. A non-loopback `jev-nudge-base-url` points the mod away from
+// jevd at a direct SystemOne route; that path needs a key, the way the upstream mod did.
+export const JEVD_BASE_URL = 'http://127.0.0.1:4377';
 export const CMD_KEY_ENV = 'CMD_API_KEY';
 export const CLI_KEY_ENV = 'COMMAND_CODE_API_KEY';
 export const COMMAND_CODE_BASE_URL = 'https://api.commandcode.ai';
-export const SYSTEM_ONE_PATH = '/provider/v1/systemone';
+export const SYSTEM_ONE_PATH = '/systemone';
 export const JEV_MODEL = 'typesafe/jev';
 
 // Measured against the live model, not picked: on this judgment Jev answers 0.5–0.8 when real
@@ -41,9 +44,12 @@ const MAX_TOOL_SUMMARY = 12;
 const MAX_TEXT_CHARS = 2_000;
 
 export interface JevConfig {
-	readonly apiKey: string;
+	/** jevd holds provider keys, so this stays unset there; direct routes need one. */
+	readonly apiKey?: string;
 	readonly baseUrl: string;
-	readonly model: string;
+	/** `undefined` sends no `model` field, so jevd's ladder picks the provider. */
+	readonly model?: string;
+	readonly jevd: boolean;
 }
 
 export interface JevFlags {
@@ -52,23 +58,36 @@ export interface JevFlags {
 }
 
 /**
- * Pick the key and endpoint. The env key wins over the stored login, as it does in the CLI;
- * flags override base URL and model. No key at all means the mod stays dormant —
- * `undefined` here is the whole self-disable.
+ * Pick the endpoint and, on a direct route, the key. A loopback base URL is jevd: no key is
+ * needed (jevd holds the provider keys) and the model is left off so jevd's ladder decides.
+ * Any other base URL is a direct SystemOne route and keeps the upstream behavior: key
+ * required, `typesafe/jev` default. `undefined` here means the mod has no usable route.
  */
 export function resolveJevConfig(params: {
 	readonly env: Readonly<Record<string, string | undefined>>;
 	readonly storedKey?: string;
 	readonly flags?: JevFlags;
 }): JevConfig | undefined {
+	const baseUrl = nonEmpty(params.flags?.baseUrl) ?? JEVD_BASE_URL;
+	const jevd = isLoopback(baseUrl);
 	const apiKey =
 		nonEmpty(params.env[CMD_KEY_ENV]) ??
 		nonEmpty(params.env[CLI_KEY_ENV]) ??
 		nonEmpty(params.storedKey);
-	if (!apiKey) return undefined;
-	const baseUrl = nonEmpty(params.flags?.baseUrl) ?? COMMAND_CODE_BASE_URL;
-	const model = nonEmpty(params.flags?.model) ?? JEV_MODEL;
-	return {apiKey, baseUrl: stripTrailingSlashes(baseUrl), model};
+	if (!jevd && !apiKey) return undefined;
+	const model = nonEmpty(params.flags?.model) ?? (jevd ? undefined : JEV_MODEL);
+	return {apiKey, baseUrl: stripTrailingSlashes(baseUrl), model, jevd};
+}
+
+/** Only the jevd relay runs loopback; every direct route is an origin `https://…` host. */
+function isLoopback(baseUrl: string): boolean {
+	const {hostname} = new URL(baseUrl);
+	return (
+		hostname === 'localhost' ||
+		hostname === '[::1]' ||
+		hostname === '::1' ||
+		hostname === '127.0.0.1'
+	);
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -244,7 +263,9 @@ export interface NudgeAnswers {
 
 // System One returns `{model, answers, usage}` with each yes/no answered as `{type: 'noul',
 // noul}`; the schema hands back plain numbers so nothing downstream sees the wire shape.
-const probability = z.object({noul: z.number()}).transform(answer => answer.noul);
+const probability = z
+	.object({noul: z.number()})
+	.transform(answer => answer.noul);
 
 export const jevResponseSchema = z.object({
 	model: z.string().optional(),

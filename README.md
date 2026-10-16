@@ -12,13 +12,30 @@ you, or when the last nudge got nothing done.
 
 ## Install
 
+Requires [jevd](#jevd) (the warm local Jev relay this fork talks to) on the same machine —
+check it with `curl -s http://127.0.0.1:4377/health`.
+
 ```bash
-cmd login                        # skip if signed in
-cmd mods add cmd-mod-jev-nudge   # add -g for all projects
+cmd mods add <your-fork>         # add -g for all projects
 ```
 
-That's it. Uses your Command Code key (`CMD_API_KEY` or `cmd login`). If Jev fails, the run stops
+No `cmd login` needed on the default route: jevd holds the provider keys and every call it
+routes is billed through the machine's own provider ladder. If Jev fails, the run stops
 as normal.
+
+### jevd
+
+This fork routes the mod's Jev call through **jevd**, the owner's warm local relay
+(`http://127.0.0.1:4377/v1/systemone`), instead of hitting TypeSafe or Command Code
+directly. jevd keeps provider connections open and runs a provider ladder per call, so a
+call answers faster and survives a dead provider. No key is sent; jevd has its own.
+
+Not on the machine with jevd? Point the mod at a direct route and bring a key:
+
+```bash
+cmd --mod . --mod-option jev-nudge-base-url=https://api.commandcode.ai/provider/v1 \
+                --mod-option jev-nudge-model=typesafe/jev   # + CMD_API_KEY / cmd login
+```
 
 ## See it
 
@@ -51,12 +68,12 @@ one, because the agent is now waiting on you.
 agent stops
    │
    ▼
-POST api.commandcode.ai/provider/v1/systemone  (typesafe/jev)
-   nudge     would a nudge help right now?        p
-   waiting   needs you: permission, info, choice? p
-   progress  did the last nudge get anywhere?     p   (2nd nudge on)
-   │
-   ▼
+POST jevd → 127.0.0.1:4377/v1/systemone  (provider ladder)
+    nudge     would a nudge help right now?        p
+    waiting   needs you: permission, info, choice? p
+    progress  did the last nudge get anywhere?     p   (2nd nudge on)
+    │
+    ▼
 waiting ≥ .5 · progress < .5 · nudge < .5 · error  →  stop
 otherwise                                          →  nudge, keep going
 ```
@@ -72,8 +89,8 @@ Command Code allows at most 8 nudges per user turn.
 | `jev-nudge-threshold` | `0.5` | Min probability to nudge |
 | `jev-nudge-max` | none | Max nudges per run, `0` = off |
 | `jev-nudge-verbose` | `false` | Show skipped nudges too |
-| `jev-nudge-base-url` | `https://api.commandcode.ai` | API root |
-| `jev-nudge-model` | `typesafe/jev` | Model id |
+| `jev-nudge-base-url` | `http://127.0.0.1:4377` | SystemOne base (jevd). Non-loopback = direct route, needs a key |
+| `jev-nudge-model` | none | Model id; absent lets jevd's ladder pick (`typesafe/jev` pins Command Code) |
 
 `DEBUG=true` logs every decision to stderr.
 

@@ -1,48 +1,81 @@
 // jev-nudge protocol tests — the pure half: key resolution, the state Jev sees, the
 // questions asked, and how probabilities become a stop-hook decision.
 
-import type {AgentMessage} from '../types.js';
 import {describe, expect, it} from 'vitest';
 import {
 	buildNudgeState,
+	COMMAND_CODE_BASE_URL,
 	DEFAULT_MAX_NUDGES,
 	DEFAULT_THRESHOLD,
 	decideNudge,
-	COMMAND_CODE_BASE_URL,
+	JEV_MODEL,
+	JEVD_BASE_URL,
 	jevResponseSchema,
 	nudgeQuestions,
 	parseMaxNudges,
 	parseThreshold,
-	JEV_MODEL,
 	resolveJevConfig,
 } from '../protocol.js';
+import type {AgentMessage} from '../types.js';
 
 describe('resolveJevConfig', () => {
-	it('is dormant without a key', () => {
-		expect(resolveJevConfig({env: {}})).toBeUndefined();
+	it('defaults to jevd on loopback, needing no key', () => {
+		expect(resolveJevConfig({env: {}})).toEqual({
+			apiKey: undefined,
+			baseUrl: JEVD_BASE_URL,
+			model: undefined,
+			jevd: true,
+		});
+		// Whitespace keys are as good as absent: jevd needs none, and a direct route
+		// is only chosen through an explicit base URL.
 		expect(
-			resolveJevConfig({env: {CMD_API_KEY: '   '}, storedKey: ''}),
-		).toBeUndefined();
+			resolveJevConfig({env: {CMD_API_KEY: '   '}, storedKey: '  '}),
+		).toMatchObject({
+			jevd: true,
+		});
 	});
 
-	it('prefers CMD_API_KEY, then COMMAND_CODE_API_KEY, then the stored login', () => {
+	it('carries a key into the config but keeps the engine flag, so the client never auths jevd', () => {
+		expect(
+			resolveJevConfig({env: {CMD_API_KEY: 'env'}, storedKey: 'stored'}),
+		).toEqual({
+			apiKey: 'env',
+			baseUrl: JEVD_BASE_URL,
+			model: undefined,
+			jevd: true,
+		});
+	});
+
+	it('needs a key on a direct (non-loopback) route, and defaults its model to typesafe/jev', () => {
+		expect(
+			resolveJevConfig({env: {}, flags: {baseUrl: COMMAND_CODE_BASE_URL}}),
+		).toBeUndefined();
 		expect(
 			resolveJevConfig({
 				env: {CMD_API_KEY: 'env', COMMAND_CODE_API_KEY: 'cli'},
 				storedKey: 'stored',
+				flags: {baseUrl: COMMAND_CODE_BASE_URL},
 			}),
 		).toEqual({
 			apiKey: 'env',
 			baseUrl: COMMAND_CODE_BASE_URL,
 			model: JEV_MODEL,
+			jevd: false,
 		});
 		expect(
-			resolveJevConfig({env: {COMMAND_CODE_API_KEY: 'cli'}, storedKey: 'stored'})
-				?.apiKey,
+			resolveJevConfig({
+				env: {COMMAND_CODE_API_KEY: 'cli'},
+				storedKey: 'stored',
+				flags: {baseUrl: COMMAND_CODE_BASE_URL},
+			})?.apiKey,
 		).toBe('cli');
-		expect(resolveJevConfig({env: {}, storedKey: 'stored'})?.apiKey).toBe(
-			'stored',
-		);
+		expect(
+			resolveJevConfig({
+				env: {},
+				storedKey: 'stored',
+				flags: {baseUrl: COMMAND_CODE_BASE_URL},
+			})?.apiKey,
+		).toBe('stored');
 	});
 
 	it('lets flags override base URL and model, trimming trailing slashes', () => {
@@ -52,6 +85,16 @@ describe('resolveJevConfig', () => {
 				flags: {baseUrl: 'https://proxy.example/v1/', model: 'jev-2'},
 			}),
 		).toMatchObject({baseUrl: 'https://proxy.example/v1', model: 'jev-2'});
+		expect(
+			resolveJevConfig({
+				env: {},
+				flags: {baseUrl: 'http://localhost:4711', model: 'auto'},
+			}),
+		).toMatchObject({
+			jevd: true,
+			baseUrl: 'http://localhost:4711',
+			model: 'auto',
+		});
 	});
 });
 
@@ -132,19 +175,17 @@ describe('buildNudgeState', () => {
 
 describe('nudgeQuestions', () => {
 	it('asks the progress guard only once a nudge already happened', () => {
+		expect(Object.keys(nudgeQuestions({hasPreviousNudge: false}))).toEqual([
+			'nudge',
+			'waiting',
+		]);
+		expect(Object.keys(nudgeQuestions({hasPreviousNudge: true}))).toEqual([
+			'nudge',
+			'waiting',
+			'progress',
+		]);
 		expect(
-			Object.keys(
-				nudgeQuestions({hasPreviousNudge: false}),
-			),
-		).toEqual(['nudge', 'waiting']);
-		expect(
-			Object.keys(
-				nudgeQuestions({hasPreviousNudge: true}),
-			),
-		).toEqual(['nudge', 'waiting', 'progress']);
-		expect(
-			nudgeQuestions({hasPreviousNudge: false}).nudge
-				.instructions,
+			nudgeQuestions({hasPreviousNudge: false}).nudge.instructions,
 		).toContain('gentle nudge');
 	});
 
